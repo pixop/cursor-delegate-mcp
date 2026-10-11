@@ -179,6 +179,89 @@ test('delegate tool defaults fast to false end-to-end when the caller omits it',
   }
 });
 
+test("delegate_start returns immediately and delegate_poll exposes progress then the normal result", async () => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  let sawSignal = "unset";
+  const runDelegate = async ({ onSessionReady, onProgress, signal }) => {
+    sawSignal = signal;
+    onSessionReady("sess-async", { cancel: async () => {}, stop: () => true });
+    onProgress("running tests");
+    await gate;
+    return { result: "done", stopReason: "end_turn", sessionId: "sess-async", filesReportedByEditTools: ["src/a.js"] };
+  };
+  const server = buildServer({ runDelegate });
+  const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "test-client", version: "1.0" });
+
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+  try {
+    const started = payload(await client.callTool({
+      name: "delegate_start",
+      arguments: { workspace: process.cwd(), spec: "long task", model: "composer-2.5" },
+    }));
+    assert.equal(started.status, "running");
+    assert.match(started.jobId, /^job_[0-9a-f-]+$/);
+    assert.equal(started.sessionId, "sess-async");
+    assert.equal(started.progress, "running tests");
+    assert.equal(sawSignal, undefined, "async work must not inherit the initiating tool request signal");
+
+    const during = payload(await client.callTool({ name: "delegate_poll", arguments: { jobId: started.jobId } }));
+    assert.deepEqual(during, {
+      jobId: started.jobId,
+      status: "running",
+      sessionId: "sess-async",
+      progress: "running tests",
+    });
+
+    release();
+    let finished;
+    for (let i = 0; i < 20; ++i) {
+      await new Promise((r) => setImmediate(r));
+      finished = payload(await client.callTool({ name: "delegate_poll", arguments: { jobId: started.jobId } }));
+      if (finished.status !== "running") break;
+    }
+    assert.equal(finished.status, "completed");
+    assert.equal(finished.sessionId, "sess-async");
+    assert.deepEqual(finished.result, {
+      result: "done",
+      stopReason: "end_turn",
+      sessionId: "sess-async",
+      filesReportedByEditTools: ["src/a.js"],
+    });
+  } finally {
+    await client.close();
+  }
+});
+
+test("delegate_poll reports failed and not-found async jobs without hanging", async () => {
+  const runDelegate = async () => { throw new Error("boom"); };
+  const server = buildServer({ runDelegate });
+  const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "test-client", version: "1.0" });
+
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+  try {
+    const started = payload(await client.callTool({
+      name: "delegate_start",
+      arguments: { workspace: process.cwd(), spec: "fail", model: "composer-2.5" },
+    }));
+    let failed;
+    for (let i = 0; i < 20; ++i) {
+      await new Promise((r) => setImmediate(r));
+      failed = payload(await client.callTool({ name: "delegate_poll", arguments: { jobId: started.jobId } }));
+      if (failed.status !== "running") break;
+    }
+    assert.equal(failed.status, "failed");
+    assert.match(failed.error, /delegate failed: boom/);
+
+    const missing = payload(await client.callTool({ name: "delegate_poll", arguments: { jobId: "job_missing" } }));
+    assert.deepEqual(missing, { jobId: "job_missing", status: "not-found" });
+  } finally {
+    await client.close();
+  }
+});
+
 test("server advertises instructions, output schemas, and conservative tool annotations", async () => {
   const server = buildServer();
   const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
@@ -208,7 +291,7 @@ test("server advertises instructions, output schemas, and conservative tool anno
     assert.match(instructions, /filesReportedByEditTools/);
     const listed = await client.listTools();
     const tools = Object.fromEntries(listed.tools.map((tool) => [tool.name, tool]));
-    assert.deepEqual(Object.keys(tools).sort(), ["cancel", "delegate", "doctor"]);
+    assert.deepEqual(Object.keys(tools).sort(), ["cancel", "delegate", "delegate_poll", "delegate_start", "doctor"]);
     // The description is what a host reads immediately before calling, so it must not
     // reassert the workspace confinement the instructions just denied.
     assert.match(tools.delegate.description, /every permission the agent requests, in any mode and anywhere on disk/i);
@@ -231,6 +314,8 @@ test("server advertises instructions, output schemas, and conservative tool anno
     // No outputSchema on any tool: declaring one forces structuredContent alongside the text
     // block, which puts the payload in the caller's context twice.
     assert.equal(tools.delegate.outputSchema, undefined);
+    assert.equal(tools.delegate_start.outputSchema, undefined);
+    assert.equal(tools.delegate_poll.outputSchema, undefined);
     assert.equal(tools.doctor.outputSchema, undefined);
     assert.equal(tools.cancel.outputSchema, undefined);
     // With the schema gone, the description is the only published source of cancel's statuses.
@@ -241,6 +326,10 @@ test("server advertises instructions, output schemas, and conservative tool anno
     assert.equal(tools.delegate.annotations.destructiveHint, true);
     assert.equal(tools.delegate.annotations.idempotentHint, false);
     assert.equal(tools.delegate.annotations.openWorldHint, true);
+    assert.equal(tools.delegate_start.annotations.readOnlyHint, false);
+    assert.equal(tools.delegate_start.annotations.destructiveHint, true);
+    assert.equal(tools.delegate_poll.annotations.readOnlyHint, true);
+    assert.equal(tools.delegate_poll.annotations.idempotentHint, true);
     assert.equal(tools.doctor.annotations.readOnlyHint, true);
     assert.equal(tools.cancel.annotations.idempotentHint, true);
   } finally {

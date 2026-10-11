@@ -28,7 +28,7 @@ Your assistant does what frontier models are for: understands the task, writes a
 
 ## ⚡ Done faster
 
-Composer 2.5 is built for throughput on multi-file edits. The whole delegation is one call — brief in, result out — so you review a finished diff instead of babysitting edits landing file by file.
+Composer 2.5 is built for throughput on multi-file edits. On hosts that support long MCP calls, the whole delegation is one call — brief in, result out. On short-deadline hosts, start once and poll the same background job, so you still review a finished diff instead of babysitting edits landing file by file.
 
 ## 🔋 Your limits stop being the bottleneck
 
@@ -41,6 +41,7 @@ Composer and Grok draw from the **Cursor Models usage pool**, separate from thir
 ## Features
 
 - 🤝 **Native plugins** — install into Claude Code, ChatGPT/Codex, or GitHub Copilot CLI and just say *"delegate this to Cursor"*. The shared skill teaches your agent how to delegate well.
+- ⏳ **Async-safe for short-deadline hosts** — `delegate_start` returns a job id immediately and `delegate_poll` reports progress/result, so multi-minute Cursor turns do not depend on one long-lived MCP request. The original synchronous `delegate` remains available for hosts that support long calls.
 - 💬 **No stalled runs** — if Cursor needs to clarify, it ends the turn and returns the question as a normal result. Your agent reads it and answers by resuming the same session — nothing blocks on a modal waiting for input.
 - 📦 **Clean, named results** — final answer, changed files, session id, and the plan, returned as one compact JSON payload. Nothing to scrape.
 - 📋 **Plan first** — `plan` mode: Cursor drafts a plan, you review it, then the same session implements it.

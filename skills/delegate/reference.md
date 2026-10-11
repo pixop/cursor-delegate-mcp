@@ -1,6 +1,6 @@
 # delegate tool reference
 
-Architecture: MCP host → MCP `delegate` → cursor-delegate-mcp → **cursor-agent** over ACP.
+Architecture: MCP host → MCP `delegate` (synchronous) or `delegate_start` + `delegate_poll` (asynchronous) → cursor-delegate-mcp → **cursor-agent** over ACP.
 
 ## Input
 
@@ -161,6 +161,19 @@ malformed value falls back to the default. Agent process exit is detected direct
 fast regardless of these.
 
 A delegation is still cancellable at any time via the `cancel` tool or a host interrupt.
+
+## Async delegation
+
+For MCP hosts that impose a request deadline shorter than a normal Cursor turn, use `delegate_start` with the same arguments as `delegate`. It returns immediately with `{jobId, status}` and may already include `sessionId` and the latest `progress`. The Cursor turn continues independently of the initiating MCP request.
+
+Poll with `delegate_poll({jobId})`:
+
+- `running` — includes the latest progress string and `sessionId` once Cursor has opened the session.
+- `completed` — includes `result`, which is exactly the normal `delegate` JSON result object.
+- `failed` — includes `error`, using the same tagged delegate error text as synchronous calls.
+- `not-found` — the id is invalid, was evicted, or the MCP server restarted.
+
+Async jobs are process-local. Restarting the MCP server stops in-flight agents through normal shutdown cleanup and forgets job records. Once a running poll exposes `sessionId`, the existing `cancel` tool can cancel that turn.
 
 ## Other tools
 
