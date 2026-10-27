@@ -6,6 +6,43 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-10-22
+
+### Fixed
+
+- `/cursor-delegate:delegate` loads the delegate skill. Claude Code loaded a slash command of the same
+  name instead, and that command only pointed back to the skill, so the workflow never reached the
+  caller. The command is removed; the skill takes the task as its argument.
+
+### Security
+
+- Lockfile bumps of the MCP SDK to 1.32.1 and `hono` to 4.13.13, clearing the high advisories
+  GHSA-22jm-h49p-29qw and GHSA-46jr-4wx8-v453 and the moderate GHSA-6prh-2h8m-c8cw,
+  GHSA-rvq5-wwqv-78pq and GHSA-5r4p-p66f-jhc7.
+
+## [2.5.2] - 2026-10-15
+
+2.5.1 was tagged but not published: its release run failed the dependency audit. Its fix
+ships in this release.
+
+### Security
+
+- Lockfile bump of `proxy-addr` to 2.0.8, clearing the critical audit advisory
+  GHSA-jqcg-44mw-7w3h in the MCP SDK's dependencies.
+
+### Internal
+
+- The release workflow also retries the MCP Registry publish on registry 5xx responses.
+  2.5.0 reached npm but not the MCP Registry after a 504.
+
+## [2.5.1] - 2026-10-15
+
+### Fixed
+
+- Hooks run on Windows under a Git Bash host. cursor-agent writes hooks as PowerShell but ran
+  them in Git Bash when it inherited `MSYSTEM` or `SHELL`, so every hooked tool call failed as
+  blocked. On win32 both are dropped from the agent's environment; it uses PowerShell.
+
 ## [2.5.0] - 2026-10-05
 
 ### Changed
