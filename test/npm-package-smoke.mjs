@@ -69,7 +69,7 @@ try {
   }
   try {
     const listed = await client.listTools();
-    assert.deepEqual(listed.tools.map((tool) => tool.name).sort(), ["cancel", "delegate", "doctor"]);
+    assert.deepEqual(listed.tools.map((tool) => tool.name).sort(), ["cancel", "delegate", "delegate_poll", "delegate_start", "doctor"]);
   } finally {
     await client.close();
   }

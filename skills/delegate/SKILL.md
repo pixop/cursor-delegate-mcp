@@ -24,7 +24,7 @@ use the `delegate` MCP tool to reach cursor-agent only.
 Scale effort to the task:
 
 - **Trivial** (one-liner, rename, typo): do it yourself — delegation overhead exceeds the task.
-- **Medium** (multi-file feature or refactor): one `delegate` call.
+- **Medium** (multi-file feature or refactor): one `delegate` call when the host supports long MCP requests; otherwise `delegate_start` and poll with `delegate_poll`.
 - **Large or risky** (architecture, wide rewrites): `mode: "plan"` first; implement after approval.
 - Never delegate a task you cannot write acceptance criteria for.
 - Purely advisory questions → `mode: "ask"`; plan with no file writes → `mode: "plan"`.
@@ -65,7 +65,7 @@ Scale effort to the task:
    > test changed.
 
    Do not create a spec file unless the user wants one saved in the repo.
-2. **Call `delegate`** on the cursor-delegate-mcp MCP server with that text in `spec`.
+2. **Call `delegate`** on hosts that support long tool calls. On hosts with short request deadlines, call `delegate_start` with the same arguments, then `delegate_poll(jobId)` until it completes; do not restart the job merely because one poll still says `running`.
 3. **Review** — read `filesReportedByEditTools` (absent when no edit tool reported a change),
    inspect the git diff, run tests/lint **yourself**,
    and check the result against the brief's acceptance criteria.
@@ -144,6 +144,7 @@ bridge does not scan for prompt injection).
 
 ## Other MCP tools
 
+- **`delegate_start` / `delegate_poll`** — background delegation for hosts whose individual MCP calls time out before Cursor finishes. Poll returns the same normal delegate result on completion.
 - **`doctor`** — setup diagnostics when the user asks or delegation fails (`agent.found`, version, client capabilities; `deep: true` for handshake).
 - **`cancel`** — best-effort cancel by `sessionId` (MCP calls are serialized; often delegate
   must finish first). If the agent ignores it and keeps going, call again with `force: true`

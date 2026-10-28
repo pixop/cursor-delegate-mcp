@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import process from "node:process";
+import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -69,7 +70,7 @@ function rememberSession(set, id) {
 // Loaded at connect, before any tool schema is, so this carries only pre-call facts: what a
 // caller needs to decide whether to delegate at all. Call-time facts belong on the parameter
 // descriptions, read while the call is being written.
-export const SERVER_INSTRUCTIONS = `Delegate coding work to Cursor through the delegate tool. Every permission the agent requests is auto-approved, in every mode: agent/plan/ask reach any file the user account can, and mode instructs the agent rather than limiting it. Scope workspace tightly and review the git diff after every run — filesReportedByEditTools carries only what the agent's edit tools reported; the diff is authoritative.`;
+export const SERVER_INSTRUCTIONS = `Delegate coding work to Cursor through delegate for short calls, or delegate_start plus delegate_poll when the host has a short request deadline or the work may run for minutes. Every permission the agent requests is auto-approved, in every mode: agent/plan/ask reach any file the user account can, and mode instructs the agent rather than limiting it. Scope workspace tightly and review the git diff after every run — filesReportedByEditTools carries only what the agent's edit tools reported; the diff is authoritative.`;
 
 const planEntrySchema = z.object({
   content: z.string(),
@@ -180,28 +181,32 @@ export const delegateInputSchema = z.object({
  *   inFlight: Map<string, Set<any>>,
  *   pending?: Set<any>,
  *   seenSessions?: Set<string>,
+ *   onJobProgress?: (message: string) => void,
+ *   onJobSessionReady?: (sessionId: string) => void,
  * }} deps
  * @returns {Promise<import("@modelcontextprotocol/sdk/types.js").CallToolResult>}
  */
-export async function runDelegateTool({ args, extra, runDelegate, inFlight, pending = new Set(), seenSessions = new Set() }) {
+export async function runDelegateTool({ args, extra, runDelegate, inFlight, pending = new Set(), seenSessions = new Set(), onJobProgress, onJobSessionReady }) {
   const { spec, mode, resumeSessionId, workspace, model, fast, effort, context, contextFiles } = args;
 
   const progressToken = extra?._meta?.progressToken;
+  let progress = 0;
   /** @type {(message: string) => void} */
-  let onProgress = () => {};
-  if (progressToken != null) {
-    let progress = 0;
-    onProgress = (message) => {
-      // sendNotification is async: its rejection settles outside this try and would exit the
-      // server. The try stays for a sync throw, which lands before Promise.resolve can wrap it.
-      try {
-        Promise.resolve(extra.sendNotification({
-          method: "notifications/progress",
-          params: { progressToken, progress: ++progress, message },
-        })).catch(() => {});
-      } catch {}
-    };
-  }
+  const onProgress = (message) => {
+    // Async jobs keep their latest progress even when the MCP host supplied no progressToken.
+    // This is deliberately separate from MCP progress: ChatGPT web currently omits the token,
+    // while delegate_start/delegate_poll must still expose useful liveness.
+    try { onJobProgress?.(message); } catch {}
+    if (progressToken == null) return;
+    // sendNotification is async: its rejection settles outside this try and would exit the
+    // server. The try stays for a sync throw, which lands before Promise.resolve can wrap it.
+    try {
+      Promise.resolve(extra.sendNotification({
+        method: "notifications/progress",
+        params: { progressToken, progress: ++progress, message },
+      })).catch(() => {});
+    } catch {}
+  };
 
   let capturedSessionId;
   let handle;
@@ -230,6 +235,7 @@ export async function runDelegateTool({ args, extra, runDelegate, inFlight, pend
         pending.delete(handle);
         registerInFlight(inFlight, sessionId, handle);
         rememberSession(seenSessions, sessionId);
+        try { onJobSessionReady?.(sessionId); } catch {}
         // Emit the id the moment the session opens, before the turn finishes, so a host that
         // can call tools concurrently has something to pass to cancel mid-run — otherwise the
         // id only arrives when delegate returns, by which point there is nothing to cancel.
@@ -265,6 +271,68 @@ export async function runDelegateTool({ args, extra, runDelegate, inFlight, pend
 export function buildServer({ runDelegate: runDelegateInjected, runDoctor: runDoctorInjected, forceGraceMs = 5000 } = {}) {
   const runDelegate = runDelegateInjected || runDelegateDefault;
   const runDoctor = runDoctorInjected || runDoctorDefault;
+
+  // Async delegation is intentionally process-local. It exists for MCP hosts with short
+  // request deadlines (notably ChatGPT web): start returns immediately, Cursor continues
+  // independently of that request, and poll reads the latest state. A server restart stops
+  // in-flight agents through the normal signal cleanup and forgets completed jobs.
+  const asyncJobs = new Map();
+  const ASYNC_JOBS_CAP = 200;
+  const pruneAsyncJobs = () => {
+    if (asyncJobs.size < ASYNC_JOBS_CAP) return;
+    for (const [jobId, job] of asyncJobs) {
+      if (job.status === "running") continue;
+      asyncJobs.delete(jobId);
+      if (asyncJobs.size < ASYNC_JOBS_CAP) break;
+    }
+  };
+  const jobPayload = (job) => {
+    const out = { jobId: job.jobId, status: job.status };
+    if (job.sessionId) out.sessionId = job.sessionId;
+    if (job.status === "running" && job.progress) out.progress = job.progress;
+    if (job.status === "completed") out.result = job.result;
+    if (job.status === "failed") out.error = job.error;
+    return out;
+  };
+  const startAsyncJob = (args) => {
+    pruneAsyncJobs();
+    const job = { jobId: `job_${randomUUID()}`, status: "running", progress: "starting" };
+    asyncJobs.set(job.jobId, job);
+
+    // Do NOT forward the delegate_start request's AbortSignal. The whole point is that Cursor
+    // outlives the short initiating MCP request; cancellation remains explicit via sessionId.
+    Promise.resolve(runDelegateTool({
+      args,
+      extra: {},
+      runDelegate,
+      inFlight,
+      pending: pendingDelegations,
+      seenSessions,
+      onJobProgress: (message) => { job.progress = message; },
+      onJobSessionReady: (sessionId) => { job.sessionId = sessionId; },
+    })).then((response) => {
+      const textPart = response?.content?.find((part) => part.type === "text");
+      const responseText = textPart?.type === "text" ? textPart.text : "";
+      if (response?.isError) {
+        job.status = "failed";
+        job.error = responseText || "delegate failed";
+        return;
+      }
+      try {
+        job.result = JSON.parse(responseText);
+        job.status = "completed";
+        job.sessionId ||= job.result?.sessionId;
+      } catch (err) {
+        job.status = "failed";
+        job.error = `delegate result parse failed: ${err?.message || String(err)}`;
+      }
+    }).catch((err) => {
+      job.status = "failed";
+      job.error = `delegate failed: ${err?.message || String(err)}`;
+    });
+    return job;
+  };
+
   const server = new McpServer(
     { name: "cursor-delegate-mcp", version: VERSION, icons: SERVER_ICONS },
     { instructions: SERVER_INSTRUCTIONS }
@@ -285,6 +353,49 @@ export function buildServer({ runDelegate: runDelegateInjected, runDoctor: runDo
       },
     },
     async (args, extra) => runDelegateTool({ args, extra, runDelegate, inFlight, pending: pendingDelegations, seenSessions })
+  );
+
+  server.registerTool(
+    "delegate_start",
+    {
+      description:
+        `Start a Cursor delegation in the background and return immediately. Use this instead of delegate when the MCP host may time out on long calls. Poll with delegate_poll. The job is process-local: restarting this MCP server loses its job record and stops its agent. Permissions and arguments are otherwise identical to delegate.`,
+      inputSchema: delegateInputSchema,
+      annotations: {
+        title: "Start async Cursor delegation",
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    async (args) => {
+      const job = startAsyncJob(args);
+      return { content: [{ type: "text", text: JSON.stringify(jobPayload(job)) }] };
+    }
+  );
+
+  server.registerTool(
+    "delegate_poll",
+    {
+      description:
+        "Poll an async delegation started by delegate_start. Returns running with latest progress and sessionId when available; completed with the normal delegate result; failed with the delegate error; or not-found after a server restart/eviction or for an invalid jobId.",
+      inputSchema: {
+        jobId: z.string().trim().min(1, "jobId must not be blank"),
+      },
+      annotations: {
+        title: "Poll async Cursor delegation",
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ jobId }) => {
+      const job = asyncJobs.get(jobId);
+      const out = job ? jobPayload(job) : { jobId, status: "not-found" };
+      return { content: [{ type: "text", text: JSON.stringify(out) }] };
+    }
   );
 
   server.registerTool(
